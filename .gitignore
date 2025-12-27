@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+dist/
+build/
+*.egg-info/
+
+# Visdax Local Vault
+.visdax_cache/
+
+# Environments
+.venv/
+env/
