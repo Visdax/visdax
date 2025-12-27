@@ -26,20 +26,20 @@ class VisdaxClient:
     # ==========================================
 
     def submit(self, file_path):
-    with open(file_path, 'rb') as f:
-        files = {'file': (os.path.basename(file_path), f)}
-        resp = requests.post(
-            f"{self.base_url}/post_file", 
-            headers=self._get_headers(), 
-            files=files
-        )
+        with open(file_path, 'rb') as f:
+            files = {'file': (os.path.basename(file_path), f)}
+            resp = requests.post(
+                f"{self.base_url}/post_file", 
+                headers=self._get_headers(), 
+                files=files
+            )
     
-    # Debugging: If not a 200 OK, print the raw response
-    if resp.status_code != 200:
-        print(f"Server Error {resp.status_code}: {resp.text}")
-        resp.raise_for_status() # This will give a better traceback
+        # Debugging: If not a 200 OK, print the raw response
+        if resp.status_code != 200:
+            print(f"Server Error {resp.status_code}: {resp.text}")
+            resp.raise_for_status() # This will give a better traceback
         
-    return resp.json()
+        return resp.json()
 
     def submit_batch(self, file_paths, n_jobs=4):
         """Parallel upload for large datasets."""
