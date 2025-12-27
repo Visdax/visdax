@@ -3,10 +3,9 @@ from pathlib import Path
 from pqdm.threads import pqdm
 
 class VisdaxClient:
-    def __init__(self, api_key, project, bucket, limit_mb=500):
+    def __init__(self, api_key, project, limit_mb=500):
         self.api_key = api_key
         self.project = project
-        self.bucket = bucket
         self.limit = limit_mb * 1024 * 1024
         self.cache_path = Path("~/.visdax_cache").expanduser()
         self.cache_path.mkdir(parents=True, exist_ok=True)
@@ -19,7 +18,6 @@ class VisdaxClient:
         return {
             "Authorization": f"Bearer {self.api_key}",
             "X-Visdax-Project": self.project,
-            "X-Visdax-Bucket": self.bucket,
         }
 
     # ==========================================
