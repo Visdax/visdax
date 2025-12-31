@@ -79,89 +79,89 @@ class VisdaxClient:
             raise Exception(f"Visdax Error: Failed to load asset '{key}'. Check server logs.")
         
         return results[0]
-
     def load_batch(self, keys, lump_size=3, n_jobs=4):
         """
-        True Enterprise Parallelism: Dispatches lumped requests in parallel.
-        Optimized for high-throughput 4K frame delivery.
+        Targeted Parallel Loader.
+        1. Single Auth Probe using 1 key + full ETag map (~0.5s).
+        2. Parallel lumps only for confirmed ML misses.
         """
-        # 1. Synchronize ETags with server-side logic
+        # 1. Generate ETag map for the entire batch
         etags = {k: hashlib.md5(k.encode()).hexdigest() for k in keys}
         
-        # 2. Divide keys into lumps of 3 to stay under 100s
-        lumps = [keys[i:i + lump_size] for i in range(0, len(keys), lump_size)]
+        # 2. GLOBAL AUTH & CACHE PROBE (restore=false)
+        # Use only the first key as the 'anchor' for authorization
+        url = f"{self.base_url.rstrip('/')}/get_multifiles?restore=false"
+        payload = {
+            "keys": [keys[0]], # Only 1 key needed for auth/routing check
+            "etags": etags      # Send all ETags so server can mark 304/200/404
+        }
         
-        # 3. Parallel Dispatch: Each thread handles one lumped request
-        # Using lambda to pass the constant 'etags' map to each worker
-        lump_results = pqdm(
-            lumps, 
-            lambda l: self._process_single_lump(l, etags), 
-            n_jobs=n_jobs, 
-            desc="Lumped Parallel Restoration"
-        )
-        
-        # 4. Flatten the parallel results while preserving original order
-        final_results = []
-        for res in lump_results:
-            if isinstance(res, list):
-                final_results.extend(res)
-        
-        return final_results
+        resp = requests.post(url, json=payload, headers=self._get_headers())
+        if resp.status_code != 200:
+            raise Exception(f"Visdax Auth Failed: {resp.status_code}")
 
-    def _process_single_lump(self, lump, etags):
-        """Internal parallel worker for a single lump of 3 images."""
-        existing_etags = {k: etags[k] for k in lump if (self.cache_path / f"{etags[k]}.webp").exists()}
-        
-        payload = {"keys": lump, "etags": existing_etags}
-        url = f"{self.base_url.rstrip('/')}/get_multifiles"
-        
-        try:
-            # 95s timeout protects against Cloudflare 524 drops
-            resp = requests.post(
-                url, 
-                json=payload, 
-                headers=self._get_headers(),
-                timeout=95 
-            )
-            
-            if resp.status_code == 200:
-                return self._materialize_lump(resp.json(), lump, etags)
-            
-            # Handle Cloudflare 524: The server worker is likely still finishing
-            if resp.status_code == 524:
-                print(f"Visdax: Lump timed out. Retrying finished assets individually...")
-                time.sleep(5)
-                # Fallback to single-item loads for this specific failed lump
-                return [self.load(k) for k in lump]
-            
-            raise Exception(f"Lump Failed: {resp.status_code}")
-
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-            # Degrading gracefully if the network or proxy hangs
-            return [self.load(k) for k in lump]
-
-    def _materialize_lump(self, data, lump_keys, etags):
-        """
-        Converts server response to NumPy arrays.
-        Resolves 'str' AttributeError and ensures (2160, 3840, 3) compatibility.
-        """
-        images = []
+        data = resp.json()
+        # The server response will tell us the status of all files matching those ETags
         assets_map = {asset['key']: asset for asset in data.get("assets", [])}
-        for key in lump_keys:
+        
+        final_images_map = {} 
+        keys_needing_restoration = []
+
+        # 3. SORT: Hits vs. Misses
+        for key in keys:
             asset = assets_map.get(key)
-            if not asset: continue
-            
             local_file = self.cache_path / f"{etags[key]}.webp"
             
-            # CASE A: AUTHORIZED CACHE HIT (~0.5s)
-            if asset['status'] == 304:
-                img = Image.open(local_file).convert("RGB")
-                images.append(np.array(img))
+            # CASE A: Hit (Already on server or in local cache)
+            if asset and asset['status'] in [304, 200]:
+                if asset['status'] == 200:
+                    local_file.write_bytes(base64.b64decode(asset['content']))
+                
+                final_images_map[key] = np.array(Image.open(local_file).convert("RGB"))
+            else:
+                # CASE B: Miss (Needs restoration)
+                keys_needing_restoration.append(key)
+
+        # 4. PARALLELIZED TARGETED RESTORATION
+        if keys_needing_restoration:
+            lumps = [keys_needing_restoration[i:i + lump_size] for i in range(0, len(keys_needing_restoration), lump_size)]
+            lump_results = pqdm(lumps, lambda l: self._process_parallel_restoration(l, etags), n_jobs=n_jobs)
             
-            # CASE B: AUTHORIZED CACHE MISS (~20s per image)
-            elif asset['status'] == 200:
+            for sub_map in lump_results:
+                if sub_map: final_images_map.update(sub_map)
+
+        return [final_images_map[k] for k in keys if k in final_images_map]
+    def _process_parallel_restoration(self, lump, etags):
+        """Worker thread for targeted ML restoration of 3 images."""
+        url = f"{self.base_url.rstrip('/')}/get_multifiles?restore=true"
+        try:
+            # Targeted request for only the missing frames
+            resp = requests.post(url, json={"keys": lump, "etags": {}}, headers=self._get_headers(), timeout=95)
+            
+            if resp.status_code == 200:
+                return self._materialize_to_dict(resp.json(), lump, etags)
+            
+            # Recovery for Cloudflare 524
+            if resp.status_code == 524:
+                return {k: self.load(k) for k in lump}
+        except:
+            return {k: self.load(k) for k in lump}
+        return {}
+    def _materialize_to_dict(self, data, keys, etags):
+        """Helper to ensure NumPy arrays are correctly mapped back to keys."""
+        result_map = {}
+        assets_map = {asset['key']: asset for asset in data.get("assets", [])}
+        for key in keys:
+            asset = assets_map.get(key)
+            if asset and asset['status'] == 200:
                 content = base64.b64decode(asset['content'])
-                local_file.write_bytes(content)
+                (self.cache_path / f"{etags[key]}.webp").write_bytes(content)
                 img = Image.open(io.BytesIO(content)).convert("RGB")
-                images.append(np.array(img))
-        return images
+                result_map[key] = np.array(img)
+        return result_map
+
+
+
+    
+
+   
