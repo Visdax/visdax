@@ -91,7 +91,7 @@ class VisdaxClient:
         
         # 2. GLOBAL CACHE PROBE (metadata only)
         # Use your new endpoint to find out which keys are already "Ready"
-        url = f"{self.base_url.rstrip('/')}/api/v1/authorize_and_check_cache"
+        url = f"{self.base_url.rstrip('/')}/authorize_and_check_cache"
         resp = requests.post(url, json={"keys": keys, "etags": etags}, headers=self._get_headers())
         
         if resp.status_code != 200:
