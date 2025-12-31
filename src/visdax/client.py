@@ -80,62 +80,73 @@ class VisdaxClient:
         
         return results[0]
 
-    def load_batch(self, keys):
+    def load_batch(self, keys, lump_size=3):
         """
-        Hardened Batch ML Function.
-        Derives identity from session token to return NumPy arrays for .shape compatibility.
+        Lumped Chunking Strategy for Enterprise Delivery.
+        Groups 3 assets per request to stay under 100s Cloudflare limit.
         """
-        # 1. GENERATE ETags 
-        # We use the raw key for the ETag to match a simplified server-side check.
+        # 1. Synchronize ETags with server-side logic
         etags = {k: hashlib.md5(k.encode()).hexdigest() for k in keys}
         
-        # Check local cache for existing .webp files
-        existing_etags = {k: v for k, v in etags.items() if (self.cache_path / f"{v}.webp").exists()}
-
-        payload = {"keys": keys, "etags": existing_etags}
+        # 2. Divide into lumps of 3
+        lumps = [keys[i:i + lump_size] for i in range(0, len(keys), lump_size)]
         
-        resp = requests.post(
-            f"{self.base_url}/get_multifiles?restore=true", 
-            json=payload, 
-            headers=self._get_headers(), # Identity is carried in these headers
-            timeout=1200
-        )
-        
-        if resp.status_code != 200:
-            if resp.status_code == 403:
-                raise Exception("Visdax Access Denied: Missing or invalid Internal SDK Secret.")
-            raise Exception(f"Visdax Batch Failed: {resp.status_code} - {resp.text}")
+        final_results = []
 
-        data = resp.json()
-        final_images = [] # Returning NumPy objects to fix 'str' AttributeError
-
-        # Map results for order preservation
-        assets_map = {asset['key']: asset for asset in data.get("assets", [])}
-
-        for key in keys:
-            asset = assets_map.get(key)
-            if not asset:
-                continue
-                
-            local_file = self.cache_path / f"{etags[key]}.webp"
-
-            # CASE A: CACHE HIT (304) - Load from disk to NumPy
-            if asset['status'] == 304:
-                os.utime(local_file, None) # Refresh LRU timestamp for cache management
-                img = Image.open(local_file).convert("RGB")
-                final_images.append(np.array(img))
+        for lump in lumps:
+            # Check local cache for these specific 3 keys
+            existing_etags = {k: etags[k] for k in lump if (self.cache_path / f"{etags[k]}.webp").exists()}
             
-            # CASE B: CACHE MISS (200) - Download and convert
+            payload = {"keys": lump, "etags": existing_etags}
+            url = f"{self.base_url.rstrip('/')}/get_multifiles"
+            
+            try:
+                # 95s timeout to catch issues before Cloudflare drops the connection
+                resp = requests.post(
+                    url, 
+                    json=payload, 
+                    headers=self._get_headers(),
+                    timeout=95 
+                )
+                
+                if resp.status_code == 200:
+                    data = resp.json()
+                    # Materialize lump into NumPy arrays
+                    lump_images = self._materialize_lump(data, lump, etags)
+                    final_results.extend(lump_images)
+                
+                elif resp.status_code == 524:
+                    # Cloudflare timeout means the server worker is still running
+                    print(f"Visdax: Lump timed out (Cloudflare 524). Retrying individually...")
+                    time.sleep(5)
+                    # Recovery: Shred this lump into individual requests
+                    final_results.extend(self.load_batch(lump, lump_size=1))
+                else:
+                    raise Exception(f"Visdax Error {resp.status_code}: {resp.text}")
+
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                # Fallback to single-item requests if the 3-image lump is too heavy
+                final_results.extend(self.load_batch(lump, lump_size=1))
+
+        return final_results
+
+    def _materialize_lump(self, data, lump_keys, etags):
+        """Helper to convert server JSON lump into NumPy array list."""
+        images = []
+        assets_map = {asset['key']: asset for asset in data.get("assets", [])}
+        for key in lump_keys:
+            asset = assets_map.get(key)
+            if not asset: continue
+            
+            local_file = self.cache_path / f"{etags[key]}.webp"
+            # Authorized Cache Hit (~0.5s Path)
+            if asset['status'] == 304:
+                img = Image.open(local_file).convert("RGB")
+                images.append(np.array(img))
+            # Authorized Cache Miss (~20s per image Path)
             elif asset['status'] == 200:
                 content = base64.b64decode(asset['content'])
-                #self._enforce_lru(len(content)) # Ensure cache doesn't exceed limits
                 local_file.write_bytes(content)
-                
-                # Convert raw bytes directly to NumPy array
                 img = Image.open(io.BytesIO(content)).convert("RGB")
-                final_images.append(np.array(img))
-            
-            else:
-                print(f"Visdax Error: Asset {key} failed with status {asset['status']}")
-
-        return final_images 
+                images.append(np.array(img))
+        return images
