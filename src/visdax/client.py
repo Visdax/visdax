@@ -80,67 +80,44 @@ class VisdaxClient:
         
         return results[0]
     def load_batch(self, keys, lump_size=3, n_jobs=4):
-        """
-        Streamlined Parallel Loader.
-        1. Probe: Checks server/local status for ALL keys in one fast call.
-        2. Resolve: Instantly materializes anything already 'Ready' (304 or 200).
-        3. Restore: Parallelizes ONLY the remaining confirmed misses.
-        """
-        # 1. Sync ETags for the entire batch
         etags = {k: hashlib.md5(k.encode()).hexdigest() for k in keys}
         
-        # 2. GLOBAL CACHE PROBE (metadata only)
-        # Use your new endpoint to find out which keys are already "Ready"
+        # 1. PROBE: Metadata only check
         url = f"{self.base_url.rstrip('/')}/authorize_and_check_cache"
         resp = requests.post(url, json={"keys": keys, "etags": etags}, headers=self._get_headers())
-        
         if resp.status_code != 200:
             raise Exception(f"Visdax Probe Failed: {resp.status_code}")
 
-        data = resp.json()
-        assets_map = {asset['key']: asset for asset in data.get("assets", [])}
-        
+        assets_map = {asset['key']: asset for asset in resp.json().get("assets", [])}
         final_images_map = {} 
-        keys_needing_restoration = []
+        keys_for_network = [] # Assets we need to actually download or restore
 
-        # 3. SORT: Valid Hits vs. Required Parallel ML
+        # 2. INSTANT MATERIALIZATION (The "No pqdm" path)
         for key in keys:
             asset = assets_map.get(key)
             local_file = self.cache_path / f"{etags[key]}.webp"
             
-            # CASE A: Ready to Materialize (Status 304 or 200)
-            if asset and asset['status'] in [304, 200]:
-                # If 200, the server has it ready but your probe didn't send the bytes.
-                # Since we don't want a separate 'download' call, we only treat 
-                # a 200 as a 'Hit' IF we already have the file locally (making it essentially a 304).
-                if local_file.exists():
-                    final_images_map[key] = np.array(Image.open(local_file).convert("RGB"))
-                else:
-                    # If it's a 200 (ready on server) but not on disk, 
-                    # we still need to 'fetch' it, so we lump it into the next phase.
-                    keys_needing_restoration.append(key)
+            # If it's a 304 OR a 200 that we already have on disk, load it instantly
+            if asset and asset['status'] in [304, 200] and local_file.exists():
+                final_images_map[key] = np.array(Image.open(local_file).convert("RGB"))
             else:
-                # CASE B: True Miss (404)
-                keys_needing_restoration.append(key)
+                # This key is NOT on disk. It must go to the network.
+                keys_for_network.append(key)
 
-        # 4. TARGETED PARALLEL RESTORATION / FETCH
-        if keys_needing_restoration:
-            lumps = [keys_needing_restoration[i:i + lump_size] for i in range(0, len(keys_needing_restoration), lump_size)]
-            
-            # This worker handles BOTH restoration and simple fetching in lumps of 3
+        # 3. CONDITIONAL PARALLEL RETRIEVAL
+        # Only trigger pqdm if there is actually work to do over the network
+        if keys_for_network:
+            lumps = [keys_for_network[i:i + lump_size] for i in range(0, len(keys_for_network), lump_size)]
             lump_results = pqdm(
                 lumps, 
                 lambda l: self._process_parallel_lump(l, etags), 
                 n_jobs=n_jobs,
                 desc="Parallel 4K Retrieval"
             )
-            
             for sub_map in lump_results:
-                if sub_map:
-                    final_images_map.update(sub_map)
+                if sub_map: final_images_map.update(sub_map)
 
         return [final_images_map[k] for k in keys if k in final_images_map]
-
     def _process_parallel_lump(self, lump, etags):
         """Worker: Fetches data for 3 images. Server handles Restore vs Download internally."""
         url = f"{self.base_url.rstrip('/')}/get_multifiles?restore=true"
