@@ -3,6 +3,7 @@ import os, requests, hashlib, base64, shutil, time,io
 from pathlib import Path
 from pqdm.threads import pqdm
 from PIL import Image
+import numpy as np
 
 class VisdaxClient:
     def __init__(self, api_key, project, limit_mb=500):
