@@ -51,18 +51,57 @@ class VisdaxClient:
     # ==========================================
 
     def load(self, key):
-        if isinstance(key, list):
-            if not key:
-                raise ValueError("Load called with an empty list.")
-            key = key[0]
-            print(f"Visdax Warning: .load() received a list. Processing first item: {key}")
+		if isinstance(key, list):
+			if not key:
+				raise ValueError("load() called with empty list")
+			logger.warning("load() received list, using first element")
+			key = key[0]
 
-        results = self.load_batch([key])
+		etag = hashlib.md5(key.encode()).hexdigest()
+		local_file = self.cache_path / f"{etag}.webp"
 
-        if not results:
-            raise Exception(f"Visdax Error: Failed to load asset '{key}'.")
+		# ---- Local cache hit ----
+		if local_file.exists():
+			try:
+				return np.array(Image.open(local_file).convert("RGB"))
+			except Exception:
+				pass  # fall through to network
 
-        return results[0]
+		# ---- Network fetch (single-file endpoint) ----
+		url = f"{self.base_url.rstrip('/')}/get_file?restore=true"
+
+		resp = requests.post(
+			url,
+			json={
+				"keys": [key],
+				"etags": {key: etag}
+			},
+			headers=self._get_headers(),
+			stream=True,
+			timeout=95
+		)
+
+		if resp.status_code != 200:
+			raise Exception(f"Visdax load failed for {key}: {resp.status_code}")
+
+		# ---- SDK-level 304 ----
+		if resp.headers.get("Content-Type", "").startswith("application/json"):
+			payload = resp.json()
+			if payload.get("status") == 304:
+				if local_file.exists():
+					return np.array(Image.open(local_file).convert("RGB"))
+				raise Exception(f"Visdax cache inconsistency for {key}")
+
+		# ---- Raw image bytes ----
+		data = resp.content
+
+		try:
+			local_file.write_bytes(data)
+			img = Image.open(io.BytesIO(data)).convert("RGB")
+			return np.array(img)
+		except Exception as e:
+			raise Exception(f"Image decode failed for {key}: {e}")
+
 
     def load_batch(self, keys, lump_size=2, n_jobs=2):
         etags = {k: hashlib.md5(k.encode()).hexdigest() for k in keys}
