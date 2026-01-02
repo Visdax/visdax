@@ -109,8 +109,8 @@ class VisdaxClient:
         if keys_for_network:
             if len(keys_for_network) == 1:
                 sub_map = self._process_parallel_lump(keys_for_network, etags)
-				if sub_map:
-					final_images_map.update(sub_map)
+			    if sub_map:
+			        final_images_map.update(sub_map)
             else:
                 lumps = [keys_for_network[i:i + lump_size] for i in range(0, len(keys_for_network), lump_size)]
                 lump_results = pqdm(
