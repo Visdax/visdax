@@ -134,99 +134,81 @@ class VisdaxClient:
         return {}
 
     def _materialize_multipart(self, resp, etags):
-        """
-        Hardened multipart/mixed Visdax response parser.
-        Returns: {key: np.ndarray}
-        """
-        ctype = resp.headers.get("Content-Type", "")
-        if "multipart/mixed" not in ctype:
-            raise RuntimeError(f"Expected multipart response, got {ctype}")
+		"""
+		RFC-correct multipart/mixed Visdax parser.
+		One part == one asset.
+		Metadata is carried in headers.
+		Returns: {key: np.ndarray}
+		"""
 
-        if "boundary=" not in ctype:
-            raise RuntimeError("Multipart response missing boundary")
+		ctype = resp.headers.get("Content-Type", "")
+		if "multipart/mixed" not in ctype:
+			raise RuntimeError(f"Expected multipart response, got {ctype}")
 
-        boundary = ctype.split("boundary=", 1)[1].strip()
-        boundary_bytes = b"--" + boundary.encode()
+		if "boundary=" not in ctype:
+			raise RuntimeError("Multipart response missing boundary")
 
-        buffer = b""
-        current_meta = None
-        result_map = {}
+		boundary = ctype.split("boundary=", 1)[1].strip()
+		boundary_bytes = b"--" + boundary.encode()
 
-        def _process_part(part):
-            nonlocal current_meta, result_map
+		buffer = b""
+		result_map = {}
 
-            part = part.strip(b"\r\n")
-            if not part:
-                return
+		def _process_part(part: bytes):
+			if not part or part in (b"--",):
+				return
 
-            if b"\r\n\r\n" not in part:
-                logger.warning("Malformed multipart part")
-                return
+			# DO NOT strip bytes — multipart framing is byte-exact
+			if b"\r\n\r\n" not in part:
+				logger.warning("Malformed multipart part (no header/body separator)")
+				return
 
-            headers_raw, body = part.split(b"\r\n\r\n", 1)
-            headers = headers_raw.decode(errors="ignore")
+			headers_raw, body = part.split(b"\r\n\r\n", 1)
+			headers_text = headers_raw.decode(errors="ignore")
 
-            if "application/json" in headers:
-                try:
-                    meta = json.loads(body.decode())
-                except Exception as e:
-                    logger.warning("Invalid JSON metadata: %s", e)
-                    current_meta = None
-                    return
+			headers = {}
+			for line in headers_text.split("\r\n"):
+				if ":" in line:
+					k, v = line.split(":", 1)
+					headers[k.strip().lower()] = v.strip()
 
-                if "key" not in meta:
-                    logger.warning("Metadata missing key")
-                    current_meta = None
-                    return
+			content_type = headers.get("content-type", "")
+			if not content_type.startswith("image/"):
+				logger.warning("Skipping non-image multipart part: %s", content_type)
+				return
 
-                current_meta = meta
-                return
+			key = headers.get("x-visdax-key")
+			if not key:
+				logger.warning("Image part missing X-Visdax-Key")
+				return
 
-            if "image/webp" in headers:
-                if not current_meta:
-                    logger.warning("Image without metadata")
-                    return
+			if key not in etags:
+				logger.warning("Unknown key %s", key)
+				return
 
-                key = current_meta.get("key")
-                if key not in etags:
-                    logger.warning("Unknown key %s", key)
-                    current_meta = None
-                    return
+			try:
+				img = Image.open(io.BytesIO(body)).convert("RGB")
+				result_map[key] = np.array(img)
+			except Exception as e:
+				logger.warning("Image decode failed for %s: %s", key, e)
 
-                path = self.cache_path / f"{etags[key]}.webp"
+		for chunk in resp.iter_content(chunk_size=16384):
+			if not chunk:
+				continue
 
-                try:
-                    path.write_bytes(body)
-                    img = Image.open(io.BytesIO(body)).convert("RGB")
-                    result_map[key] = np.array(img)
-                except Exception as e:
-                    logger.warning("Image decode failed: %s", e)
+			buffer += chunk
 
-                current_meta = None
-                return
+			while True:
+				idx = buffer.find(boundary_bytes)
+				if idx == -1:
+					buffer = buffer[-len(boundary_bytes):]
+					break
 
-            logger.warning("Unknown multipart content")
+				part = buffer[:idx]
+				buffer = buffer[idx + len(boundary_bytes):]
+				_process_part(part)
 
-        for chunk in resp.iter_content(chunk_size=16384):
-            if not chunk:
-                continue
+		if buffer.strip(b"\r\n-"):
+			_process_part(buffer)
 
-            buffer += chunk
-
-            while True:
-                idx = buffer.find(boundary_bytes)
-                if idx == -1:
-                    buffer = buffer[-len(boundary_bytes):]
-                    break
-
-                part = buffer[:idx]
-                buffer = buffer[idx + len(boundary_bytes):]
-                _process_part(part)
-
-        if buffer.strip():
-            _process_part(buffer)
-
-        if current_meta is not None:
-            logger.warning("Dangling metadata: %s", current_meta)
-
-        return result_map
+		return result_map
