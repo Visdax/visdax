@@ -102,7 +102,6 @@ class VisdaxClient:
 		except Exception as e:
 			raise Exception(f"Image decode failed for {key}: {e}")
 
-
     def load_batch(self, keys, lump_size=2, n_jobs=2):
         etags = {k: hashlib.md5(k.encode()).hexdigest() for k in keys}
 
